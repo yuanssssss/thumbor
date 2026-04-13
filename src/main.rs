@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
     Extension, Router,
-    extract::{Multipart, Path},
+    extract::{DefaultBodyLimit, Multipart, Path},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::Html,
     routing::{get, post},
@@ -153,6 +153,7 @@ async fn main() {
         .route("/api/process", post(process_upload))
         .route("/api/upload", post(upload_and_save))
         .route("/image/{spec}/{url}", get(generate))
+        .layer(DefaultBodyLimit::max((MAX_FILE_SIZE + 1024 * 1024) as usize))
         .layer(
             ServiceBuilder::new()
                 .layer(
