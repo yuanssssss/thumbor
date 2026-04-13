@@ -354,7 +354,24 @@ async fn process_upload(
         );
     }
     
-    let mut engine = Photon::try_from(image).map_err(|e| {
+    // Store original size for comparison
+    let original_size = image.len();
+    
+    // Convert image to processable format if needed (e.g., PNG to JPEG)
+    let processable_image = match ensure_processable_format(&image) {
+        Ok(converted) => {
+            if converted.len() != original_size {
+                info!("Image format converted for processing ({} → {} bytes)", original_size, converted.len());
+            }
+            converted
+        }
+        Err(e) => {
+            warn!("Failed to convert image format: {}", e);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    
+    let mut engine = Photon::try_from(processable_image).map_err(|e| {
         warn!("Failed to create Photon engine: {}", e);
         StatusCode::BAD_REQUEST
     })?;
@@ -550,6 +567,48 @@ fn detect_upload_extension(original_filename: Option<&str>, data: &[u8]) -> Stri
         .map(image_format_extension)
         .unwrap_or("bin")
         .to_string()
+}
+
+/// Convert image to JPEG bytes if needed
+fn ensure_processable_format(data: &Bytes) -> Result<Bytes, String> {
+    match image::guess_format(data) {
+        Ok(ImageFormat::Jpeg) => Ok(data.clone()),
+        Ok(ImageFormat::Png) | Ok(ImageFormat::WebP) | Ok(ImageFormat::Gif) | Ok(ImageFormat::Bmp) => {
+            info!("Converting non-JPEG format to JPEG for Photon processing");
+            convert_to_jpeg(data)
+        }
+        Ok(format) => {
+            warn!("Attempting to process {} format", image_format_extension(format));
+            convert_to_jpeg(data)
+        }
+        Err(_) => {
+            warn!("Unknown image format, attempting to convert to JPEG");
+            convert_to_jpeg(data)
+        }
+    }
+}
+
+/// Convert any image format to JPEG
+fn convert_to_jpeg(data: &[u8]) -> Result<Bytes, String> {
+    let img = image::load_from_memory(data)
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+    
+    info!("Image loaded: {}x{}", img.width(), img.height());
+    
+    let rgba_img = img.to_rgba8();
+    
+    let mut jpeg_data = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 85)
+        .encode(
+            &rgba_img,
+            rgba_img.width(),
+            rgba_img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+    
+    info!("Successfully converted to JPEG ({} bytes)", jpeg_data.len());
+    Ok(Bytes::from(jpeg_data))
 }
 
 fn extract_extension(filename: &str) -> Option<String> {
