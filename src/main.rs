@@ -5,11 +5,12 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     response::Html,
     routing::{get, post},
+    Json,
 };
 use bytes::Bytes;
 use lru::LruCache;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, percent_encode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::hash_map::DefaultHasher,
     convert::TryInto,
@@ -19,6 +20,7 @@ use std::{
     vec,
 };
 use tower_http::add_extension::AddExtensionLayer;
+use uuid::Uuid;
 
 use tokio::{net::TcpListener, sync::Mutex};
 use tower::ServiceBuilder;
@@ -35,15 +37,34 @@ struct Params {
     url: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct UploadResponse {
+    success: bool,
+    message: String,
+    filename: Option<String>,
+}
+
+// 10MB limit
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 type Cache = Arc<Mutex<LruCache<u64, Bytes>>>;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
     let cache: Cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())));
+    
+    // Create uploads directory if it doesn't exist
+    let uploads_dir = "uploads";
+    tokio::fs::create_dir_all(uploads_dir)
+        .await
+        .expect("Failed to create uploads directory");
+    info!("Uploads directory created/verified at: {}", uploads_dir);
+    
     let app = Router::new()
         .route("/", get(index))
         .route("/api/process", post(process_upload))
+        .route("/api/upload", post(upload_and_save))
         .route("/image/{spec}/{url}", get(generate))
         .layer(
             ServiceBuilder::new()
@@ -147,6 +168,94 @@ async fn process_upload(mut multipart: Multipart) -> Result<(HeaderMap, Vec<u8>)
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("image/jpeg"));
     Ok((headers, engine.generate(ImageFormat::Jpeg)))
+}
+
+#[instrument(level = "info")]
+async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse>, StatusCode> {
+    let uploads_dir = "uploads";
+    
+    // Parse multipart form
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        
+        if name == "image" {
+            // Get the file data
+            let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+            
+            // Check file size (10MB limit)
+            if data.len() > MAX_FILE_SIZE as usize {
+                let msg = format!(
+                    "File too large: {} bytes (max: {} bytes)", 
+                    data.len(), 
+                    MAX_FILE_SIZE
+                );
+                info!("{}", msg);
+                return Ok(Json(UploadResponse {
+                    success: false,
+                    message: msg,
+                    filename: None,
+                }));
+            }
+            
+            // Validate that it's a valid image
+            if data.is_empty() {
+                let msg = "Empty file".to_string();
+                info!("{}", msg);
+                return Ok(Json(UploadResponse {
+                    success: false,
+                    message: msg,
+                    filename: None,
+                }));
+            }
+            
+            // Try to determine image format
+            let format_result = image::guess_format(&data).map_err(|_| StatusCode::BAD_REQUEST);
+            if format_result.is_err() {
+                let msg = "Invalid image format".to_string();
+                info!("{}", msg);
+                return Ok(Json(UploadResponse {
+                    success: false,
+                    message: msg,
+                    filename: None,
+                }));
+            }
+            
+            // Generate unique filename
+            let uuid = Uuid::new_v4();
+            let filename = format!("{}.jpg", uuid);
+            let filepath = format!("{}/{}", uploads_dir, filename);
+            
+            // Save the file
+            tokio::fs::write(&filepath, &data)
+                .await
+                .map_err(|e| {
+                    info!("Failed to save file: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            
+            info!(
+                "Image saved successfully: {} ({} bytes)",
+                filename,
+                data.len()
+            );
+            
+            return Ok(Json(UploadResponse {
+                success: true,
+                message: "Image uploaded and saved successfully".to_string(),
+                filename: Some(filename),
+            }));
+        }
+    }
+    
+    Ok(Json(UploadResponse {
+        success: false,
+        message: "No image field found in request".to_string(),
+        filename: None,
+    }))
 }
 
 #[instrument(level = "info", skip(cache))]
