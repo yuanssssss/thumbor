@@ -16,7 +16,6 @@ use std::{
     convert::TryInto,
     hash::{Hash, Hasher},
     num::NonZeroUsize,
-    path::Path as FsPath,
     path::PathBuf,
     sync::Arc,
     vec,
@@ -52,7 +51,6 @@ struct UploadResponse {
 
 struct UploadedImage {
     data: Bytes,
-    original_filename: Option<String>,
 }
 
 // 10MB limit
@@ -279,7 +277,6 @@ async fn process_upload(
 ) -> Result<(HeaderMap, Vec<u8>), StatusCode> {
     info!("POST /api/process - Image processing request received");
     let mut image = None;
-    let mut original_filename = None;
     let mut options = ProcessOptions::default();
 
     while let Some(field) = multipart
@@ -295,7 +292,6 @@ async fn process_upload(
         
         match name.as_str() {
             "image" => {
-                original_filename = field.file_name().map(str::to_owned);
                 let data = field.bytes().await.map_err(|e| {
                     warn!("Failed to read image bytes: {}", e);
                     StatusCode::BAD_REQUEST
@@ -333,35 +329,16 @@ async fn process_upload(
     info!("Image data prepared for processing");
 
     let upload_id = Uuid::new_v4();
-    let original_extension = detect_upload_extension(original_filename.as_deref(), &image);
-    let original_filename = format!("{}_original.{}", upload_id, original_extension);
-    let original_filepath = uploads_path.join(&original_filename);
 
-    info!("  Saving original uploaded image:");
-    info!("    Filename: {}", original_filename);
-    info!("    Path: {}", original_filepath.display());
-
-    if let Err(e) = tokio::fs::write(&original_filepath, &image).await {
-        warn!(
-            "⚠ Failed to save original uploaded image to {}: {}",
-            original_filepath.display(),
-            e
-        );
-    } else {
-        info!(
-            "  ✓ Original uploaded image saved successfully to: {}",
-            original_filepath.display()
-        );
-    }
-    
-    // Store original size for comparison
     let original_size = image.len();
-    
-    // Convert image to processable format if needed (e.g., PNG to JPEG)
-    let processable_image = match ensure_processable_format(&image) {
+    let normalized_image = match ensure_processable_format(&image) {
         Ok(converted) => {
             if converted.len() != original_size {
-                info!("Image format converted for processing ({} → {} bytes)", original_size, converted.len());
+                info!(
+                    "Image normalized to JPEG for storage and processing ({} → {} bytes)",
+                    original_size,
+                    converted.len()
+                );
             }
             converted
         }
@@ -370,8 +347,28 @@ async fn process_upload(
             return Err(StatusCode::BAD_REQUEST);
         }
     };
+
+    let normalized_filename = format!("{}_uploaded.jpg", upload_id);
+    let normalized_filepath = uploads_path.join(&normalized_filename);
+
+    info!("  Saving normalized uploaded image:");
+    info!("    Filename: {}", normalized_filename);
+    info!("    Path: {}", normalized_filepath.display());
+
+    if let Err(e) = tokio::fs::write(&normalized_filepath, &normalized_image).await {
+        warn!(
+            "⚠ Failed to save normalized uploaded image to {}: {}",
+            normalized_filepath.display(),
+            e
+        );
+    } else {
+        info!(
+            "  ✓ Normalized uploaded image saved successfully to: {}",
+            normalized_filepath.display()
+        );
+    }
     
-    let mut engine = Photon::try_from(processable_image).map_err(|e| {
+    let mut engine = Photon::try_from(normalized_image).map_err(|e| {
         warn!("Failed to create Photon engine: {}", e);
         StatusCode::BAD_REQUEST
     })?;
@@ -414,10 +411,7 @@ async fn upload_and_save(
     // Parse multipart form with better error handling
     match parse_multipart_field(&mut multipart).await {
         Ok(Some(uploaded)) => {
-            let UploadedImage {
-                data,
-                original_filename,
-            } = uploaded;
+            let UploadedImage { data } = uploaded;
 
             info!("  Received data: {} bytes", data.len());
             
@@ -447,18 +441,32 @@ async fn upload_and_save(
                 }));
             }
             
-            // Try to determine image format, but don't fail if we can't
-            if let Ok(format) = image::guess_format(&data) {
-                info!("  Image format detected: {:?}", format);
-            } else {
-                info!("  Could not detect image format, but proceeding with upload");
-            }
-            
-            let extension = detect_upload_extension(original_filename.as_deref(), &data);
+            let normalized_image = match ensure_processable_format(&data) {
+                Ok(converted) => {
+                    if converted.len() != data.len() {
+                        info!(
+                            "  Image normalized to JPEG before saving ({} → {} bytes)",
+                            data.len(),
+                            converted.len()
+                        );
+                    } else {
+                        info!("  Image already JPEG, no conversion needed");
+                    }
+                    converted
+                }
+                Err(e) => {
+                    warn!("✗ Failed to normalize uploaded image: {}", e);
+                    return Ok(Json(UploadResponse {
+                        success: false,
+                        message: format!("Failed to convert image to JPEG: {}", e),
+                        filename: None,
+                    }));
+                }
+            };
 
             // Generate unique filename
             let uuid = Uuid::new_v4();
-            let filename = format!("{}.{}", uuid, extension);
+            let filename = format!("{}.jpg", uuid);
             let filepath = uploads_path.join(&filename);
             
             info!("  Filename: {}", filename);
@@ -475,7 +483,7 @@ async fn upload_and_save(
             }
             
             // Save the file
-            match tokio::fs::write(&filepath, &data).await {
+            match tokio::fs::write(&filepath, &normalized_image).await {
                 Ok(_) => {
                     info!("  File write completed");
                     
@@ -483,10 +491,14 @@ async fn upload_and_save(
                     match tokio::fs::metadata(&filepath).await {
                         Ok(meta) => {
                             info!("  ✓ File verified: size={} bytes", meta.len());
-                            info!("✓ Image saved successfully: {} ({} bytes)", filepath.display(), data.len());
+                            info!(
+                                "✓ Image saved successfully as JPEG: {} ({} bytes)",
+                                filepath.display(),
+                                normalized_image.len()
+                            );
                             Ok(Json(UploadResponse {
                                 success: true,
-                                message: format!("Image uploaded and saved to: {}", filepath.display()),
+                                message: format!("Image uploaded, converted to JPEG, and saved to: {}", filepath.display()),
                                 filename: Some(filename),
                             }))
                         }
@@ -538,13 +550,9 @@ async fn parse_multipart_field(multipart: &mut Multipart) -> Result<Option<Uploa
                 let name = field.name().unwrap_or_default().to_owned();
                 
                 if name == "image" {
-                    let original_filename = field.file_name().map(str::to_owned);
                     match field.bytes().await {
                         Ok(data) => {
-                            return Ok(Some(UploadedImage {
-                                data,
-                                original_filename,
-                            }))
+                            return Ok(Some(UploadedImage { data }))
                         }
                         Err(e) => return Err(format!("Failed to read file bytes: {}", e)),
                     }
@@ -554,19 +562,6 @@ async fn parse_multipart_field(multipart: &mut Multipart) -> Result<Option<Uploa
             Err(e) => return Err(format!("Multipart parsing failed: {}", e)),
         }
     }
-}
-
-fn detect_upload_extension(original_filename: Option<&str>, data: &[u8]) -> String {
-    if let Some(filename) = original_filename {
-        if let Some(extension) = extract_extension(filename) {
-            return extension;
-        }
-    }
-
-    image::guess_format(data)
-        .map(image_format_extension)
-        .unwrap_or("bin")
-        .to_string()
 }
 
 /// Convert image to JPEG bytes if needed
@@ -609,19 +604,6 @@ fn convert_to_jpeg(data: &[u8]) -> Result<Bytes, String> {
     
     info!("Successfully converted to JPEG ({} bytes)", jpeg_data.len());
     Ok(Bytes::from(jpeg_data))
-}
-
-fn extract_extension(filename: &str) -> Option<String> {
-    FsPath::new(filename)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::trim)
-        .filter(|ext| !ext.is_empty())
-        .map(|ext| ext.to_ascii_lowercase())
-        .filter(|ext| {
-            ext.chars()
-                .all(|ch| ch.is_ascii_alphanumeric())
-        })
 }
 
 fn image_format_extension(format: ImageFormat) -> &'static str {
