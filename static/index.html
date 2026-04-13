@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Thumbor Studio</title>
+  <style>
+    :root {
+      --bg: #f5efe4;
+      --panel: rgba(255, 251, 245, 0.82);
+      --line: rgba(63, 51, 42, 0.12);
+      --ink: #221b16;
+      --muted: #6d5e53;
+      --accent: #cf5f38;
+      --accent-strong: #9f3f1d;
+      --shadow: 0 20px 60px rgba(86, 59, 41, 0.14);
+      --radius: 26px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "IBM Plex Sans", "PingFang SC", "Noto Sans SC", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(255, 255, 255, 0.85), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(207, 95, 56, 0.18), transparent 25%),
+        linear-gradient(135deg, #f1e2ca 0%, #f7f3ec 45%, #efe6d9 100%);
+    }
+
+    .shell {
+      width: min(1200px, calc(100vw - 32px));
+      margin: 24px auto;
+      display: grid;
+      grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+      gap: 20px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .controls {
+      padding: 24px;
+    }
+
+    .viewer {
+      padding: 18px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .hero {
+      margin-bottom: 20px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(207, 95, 56, 0.12);
+      color: var(--accent-strong);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 14px 0 10px;
+      font-family: "Azeret Mono", "IBM Plex Mono", monospace;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+    }
+
+    .hero p,
+    .field-hint,
+    .status {
+      color: var(--muted);
+    }
+
+    form {
+      display: grid;
+      gap: 16px;
+    }
+
+    .section {
+      padding: 16px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.55);
+      border: 1px solid rgba(63, 51, 42, 0.08);
+    }
+
+    .section-title {
+      margin: 0 0 12px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent-strong);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    input,
+    select,
+    button {
+      font: inherit;
+    }
+
+    input[type="number"],
+    input[type="file"],
+    select {
+      width: 100%;
+      border: 1px solid rgba(63, 51, 42, 0.12);
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: rgba(255, 255, 255, 0.9);
+      color: var(--ink);
+    }
+
+    input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--accent);
+    }
+
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .primary,
+    .ghost {
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 18px;
+      cursor: pointer;
+      transition: transform 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+    }
+
+    .primary {
+      background: linear-gradient(135deg, var(--accent) 0%, #e8894e 100%);
+      color: white;
+      box-shadow: 0 12px 24px rgba(207, 95, 56, 0.26);
+    }
+
+    .ghost {
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--ink);
+      border: 1px solid rgba(63, 51, 42, 0.12);
+    }
+
+    .primary:hover,
+    .ghost:hover {
+      transform: translateY(-1px);
+    }
+
+    .primary:disabled,
+    .ghost:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+      transform: none;
+    }
+
+    .preview-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      height: 100%;
+    }
+
+    .frame {
+      min-height: 280px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background:
+        linear-gradient(135deg, rgba(255,255,255,0.75), rgba(255,255,255,0.45)),
+        repeating-linear-gradient(
+          45deg,
+          rgba(34, 27, 22, 0.03) 0,
+          rgba(34, 27, 22, 0.03) 14px,
+          rgba(255, 255, 255, 0.04) 14px,
+          rgba(255, 255, 255, 0.04) 28px
+        );
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .frame-head {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .frame-body {
+      display: grid;
+      place-items: center;
+      padding: 16px;
+    }
+
+    .frame img {
+      max-width: 100%;
+      max-height: 480px;
+      object-fit: contain;
+      border-radius: 16px;
+      box-shadow: 0 16px 40px rgba(34, 27, 22, 0.12);
+    }
+
+    .empty {
+      max-width: 280px;
+      text-align: center;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .status {
+      min-height: 22px;
+      font-size: 14px;
+    }
+
+    .status.error {
+      color: #af2c2c;
+    }
+
+    .download {
+      text-decoration: none;
+    }
+
+    @media (max-width: 960px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .preview-grid,
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="shell">
+    <section class="panel controls">
+      <div class="hero">
+        <span class="eyebrow">Thumbor Studio</span>
+        <h1>上传一张图，组合几步操作，直接拿回结果。</h1>
+        <p>这个界面会把文件上传到当前 Rust 服务的 <code>/api/process</code>，处理完成后返回一张 JPEG 图片。</p>
+      </div>
+
+      <form @submit.prevent="submit">
+        <div class="section">
+          <h2 class="section-title">图片</h2>
+          <label>
+            选择文件
+            <input type="file" accept="image/*" @change="onFileChange" />
+          </label>
+          <div class="field-hint">建议先用 JPG、PNG 或 WebP 测试。</div>
+        </div>
+
+        <div class="section">
+          <h2 class="section-title">Resize</h2>
+          <div class="grid">
+            <label>
+              宽度
+              <input type="number" min="1" v-model="form.resizeWidth" placeholder="500" />
+            </label>
+            <label>
+              高度
+              <input type="number" min="1" v-model="form.resizeHeight" placeholder="800" />
+            </label>
+            <label>
+              方式
+              <select v-model="form.resizeType">
+                <option value="normal">Normal</option>
+                <option value="seam_carve">Seam Carve</option>
+              </select>
+            </label>
+            <label>
+              采样
+              <select v-model="form.resizeFilter">
+                <option value="catmull_rom">Catmull Rom</option>
+                <option value="nearest">Nearest</option>
+                <option value="triangle">Triangle</option>
+                <option value="gaussian">Gaussian</option>
+                <option value="lanczos3">Lanczos3</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="section">
+          <h2 class="section-title">Crop</h2>
+          <div class="grid">
+            <label>
+              x1
+              <input type="number" min="0" v-model="form.cropX1" />
+            </label>
+            <label>
+              y1
+              <input type="number" min="0" v-model="form.cropY1" />
+            </label>
+            <label>
+              x2
+              <input type="number" min="1" v-model="form.cropX2" />
+            </label>
+            <label>
+              y2
+              <input type="number" min="1" v-model="form.cropY2" />
+            </label>
+          </div>
+        </div>
+
+        <div class="section">
+          <h2 class="section-title">Effects</h2>
+          <div class="grid">
+            <label>
+              Contrast
+              <input type="number" step="0.1" v-model="form.contrast" placeholder="0 或 20" />
+            </label>
+            <label>
+              Filter
+              <select v-model="form.imageFilter">
+                <option value="">None</option>
+                <option value="oceanic">Oceanic</option>
+                <option value="islands">Islands</option>
+                <option value="marine">Marine</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid" style="margin-top:12px">
+            <label class="toggle">
+              <input type="checkbox" v-model="form.fliph" />
+              水平翻转
+            </label>
+            <label class="toggle">
+              <input type="checkbox" v-model="form.flipv" />
+              垂直翻转
+            </label>
+          </div>
+        </div>
+
+        <div class="section">
+          <h2 class="section-title">Watermark</h2>
+          <label class="toggle">
+            <input type="checkbox" v-model="form.watermark" />
+            启用水印
+          </label>
+          <div class="grid" style="margin-top:12px">
+            <label>
+              水印 X
+              <input type="number" min="0" v-model="form.watermarkX" />
+            </label>
+            <label>
+              水印 Y
+              <input type="number" min="0" v-model="form.watermarkY" />
+            </label>
+          </div>
+          <div class="field-hint">如果服务端水印资源不可用，会自动跳过，不会导致请求失败。</div>
+        </div>
+
+        <div class="actions">
+          <button class="primary" type="submit" :disabled="submitting || !file">生成图片</button>
+          <button class="ghost" type="button" @click="resetForm" :disabled="submitting">重置参数</button>
+          <a v-if="resultUrl" class="ghost download" :href="resultUrl" download="thumbor-output.jpg">下载结果</a>
+        </div>
+
+        <div class="status" :class="{ error: error }">{{ error || status }}</div>
+      </form>
+    </section>
+
+    <section class="panel viewer">
+      <div class="preview-grid">
+        <article class="frame">
+          <div class="frame-head">Original</div>
+          <div class="frame-body">
+            <img v-if="previewUrl" :src="previewUrl" alt="原图预览" />
+            <div v-else class="empty">先选择一张图片。这里会显示本地预览，方便你在提交前确认素材。</div>
+          </div>
+        </article>
+
+        <article class="frame">
+          <div class="frame-head">Output</div>
+          <div class="frame-body">
+            <img v-if="resultUrl" :src="resultUrl" alt="处理结果" />
+            <div v-else class="empty">处理完成后，结果图会显示在这里。当前输出固定为 JPEG。</div>
+          </div>
+        </article>
+      </div>
+    </section>
+  </div>
+
+  <script type="module">
+    import { createApp } from 'https://unpkg.com/vue@3/dist/vue.esm-browser.prod.js';
+
+    const defaults = () => ({
+      resizeWidth: '',
+      resizeHeight: '',
+      resizeType: 'normal',
+      resizeFilter: 'catmull_rom',
+      cropX1: '',
+      cropY1: '',
+      cropX2: '',
+      cropY2: '',
+      contrast: '',
+      imageFilter: '',
+      fliph: false,
+      flipv: false,
+      watermark: false,
+      watermarkX: 20,
+      watermarkY: 20,
+    });
+
+    createApp({
+      data() {
+        return {
+          file: null,
+          previewUrl: '',
+          resultUrl: '',
+          submitting: false,
+          status: '选择图片后即可开始。',
+          error: '',
+          form: defaults(),
+        };
+      },
+      methods: {
+        onFileChange(event) {
+          const [file] = event.target.files || [];
+          this.file = file || null;
+          this.error = '';
+          this.status = this.file ? `已选择 ${this.file.name}` : '选择图片后即可开始。';
+
+          if (this.previewUrl) URL.revokeObjectURL(this.previewUrl);
+          this.previewUrl = this.file ? URL.createObjectURL(this.file) : '';
+        },
+        resetForm() {
+          this.form = defaults();
+          this.error = '';
+          this.status = this.file ? `已选择 ${this.file.name}` : '选择图片后即可开始。';
+          if (this.resultUrl) {
+            URL.revokeObjectURL(this.resultUrl);
+            this.resultUrl = '';
+          }
+        },
+        appendField(fd, key, value) {
+          if (value === '' || value === null || value === undefined) return;
+          fd.append(key, String(value));
+        },
+        async submit() {
+          if (!this.file) {
+            this.error = '请先选择一张图片。';
+            return;
+          }
+
+          this.submitting = true;
+          this.error = '';
+          this.status = '服务端处理中...';
+
+          const fd = new FormData();
+          fd.append('image', this.file);
+          this.appendField(fd, 'resize_width', this.form.resizeWidth);
+          this.appendField(fd, 'resize_height', this.form.resizeHeight);
+          this.appendField(fd, 'resize_type', this.form.resizeType);
+          this.appendField(fd, 'resize_filter', this.form.resizeFilter);
+          this.appendField(fd, 'crop_x1', this.form.cropX1);
+          this.appendField(fd, 'crop_y1', this.form.cropY1);
+          this.appendField(fd, 'crop_x2', this.form.cropX2);
+          this.appendField(fd, 'crop_y2', this.form.cropY2);
+          this.appendField(fd, 'contrast', this.form.contrast);
+          this.appendField(fd, 'image_filter', this.form.imageFilter);
+          this.appendField(fd, 'fliph', this.form.fliph);
+          this.appendField(fd, 'flipv', this.form.flipv);
+          this.appendField(fd, 'watermark', this.form.watermark);
+          this.appendField(fd, 'watermark_x', this.form.watermarkX);
+          this.appendField(fd, 'watermark_y', this.form.watermarkY);
+
+          try {
+            const response = await fetch('/api/process', {
+              method: 'POST',
+              body: fd,
+            });
+
+            if (!response.ok) {
+              throw new Error(`请求失败: ${response.status}`);
+            }
+
+            const blob = await response.blob();
+            if (this.resultUrl) URL.revokeObjectURL(this.resultUrl);
+            this.resultUrl = URL.createObjectURL(blob);
+            this.status = '处理完成，可以继续微调参数或下载结果。';
+          } catch (error) {
+            this.error = error instanceof Error ? error.message : '处理失败';
+            this.status = '';
+          } finally {
+            this.submitting = false;
+          }
+        },
+      },
+      beforeUnmount() {
+        if (this.previewUrl) URL.revokeObjectURL(this.previewUrl);
+        if (this.resultUrl) URL.revokeObjectURL(this.resultUrl);
+      },
+    }).mount('#app');
+  </script>
+</body>
+</html>
