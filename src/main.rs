@@ -176,18 +176,9 @@ async fn process_upload(mut multipart: Multipart) -> Result<(HeaderMap, Vec<u8>)
 async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse>, StatusCode> {
     let uploads_dir = "uploads";
     
-    // Parse multipart form
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?
-    {
-        let name = field.name().unwrap_or_default().to_owned();
-        
-        if name == "image" {
-            // Get the file data
-            let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
-            
+    // Parse multipart form with better error handling
+    match parse_multipart_field(&mut multipart).await {
+        Ok(Some(data)) => {
             // Check file size (10MB limit)
             if data.len() > MAX_FILE_SIZE as usize {
                 let msg = format!(
@@ -195,7 +186,7 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
                     data.len(), 
                     MAX_FILE_SIZE
                 );
-                info!("{}", msg);
+                info!("Upload failed: {}", msg);
                 return Ok(Json(UploadResponse {
                     success: false,
                     message: msg,
@@ -203,10 +194,9 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
                 }));
             }
             
-            // Validate that it's a valid image
             if data.is_empty() {
                 let msg = "Empty file".to_string();
-                info!("{}", msg);
+                info!("Upload failed: {}", msg);
                 return Ok(Json(UploadResponse {
                     success: false,
                     message: msg,
@@ -214,16 +204,12 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
                 }));
             }
             
-            // Try to determine image format
-            let format_result = image::guess_format(&data).map_err(|_| StatusCode::BAD_REQUEST);
-            if format_result.is_err() {
-                let msg = "Invalid image format".to_string();
-                info!("{}", msg);
-                return Ok(Json(UploadResponse {
-                    success: false,
-                    message: msg,
-                    filename: None,
-                }));
+            // Try to determine image format, but don't fail if we can't
+            // Some image formats may not be recognized, but we save anyway
+            if let Ok(format) = image::guess_format(&data) {
+                info!("Detected image format: {:?}", format);
+            } else {
+                info!("Could not detect image format, but proceeding with upload");
             }
             
             // Generate unique filename
@@ -232,32 +218,62 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
             let filepath = format!("{}/{}", uploads_dir, filename);
             
             // Save the file
-            tokio::fs::write(&filepath, &data)
-                .await
-                .map_err(|e| {
+            match tokio::fs::write(&filepath, &data).await {
+                Ok(_) => {
+                    info!("Image saved successfully: {} ({} bytes)", filename, data.len());
+                    Ok(Json(UploadResponse {
+                        success: true,
+                        message: "Image uploaded and saved successfully".to_string(),
+                        filename: Some(filename),
+                    }))
+                }
+                Err(e) => {
                     info!("Failed to save file: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-            
-            info!(
-                "Image saved successfully: {} ({} bytes)",
-                filename,
-                data.len()
-            );
-            
-            return Ok(Json(UploadResponse {
-                success: true,
-                message: "Image uploaded and saved successfully".to_string(),
-                filename: Some(filename),
-            }));
+                    Ok(Json(UploadResponse {
+                        success: false,
+                        message: format!("Failed to save file: {}", e),
+                        filename: None,
+                    }))
+                }
+            }
+        }
+        Ok(None) => {
+            let msg = "No image field found in request".to_string();
+            info!("Upload failed: {}", msg);
+            Ok(Json(UploadResponse {
+                success: false,
+                message: msg,
+                filename: None,
+            }))
+        }
+        Err(e) => {
+            info!("Multipart parsing error: {}", e);
+            Ok(Json(UploadResponse {
+                success: false,
+                message: format!("Invalid request format: {}", e),
+                filename: None,
+            }))
         }
     }
-    
-    Ok(Json(UploadResponse {
-        success: false,
-        message: "No image field found in request".to_string(),
-        filename: None,
-    }))
+}
+
+async fn parse_multipart_field(multipart: &mut Multipart) -> Result<Option<Bytes>, String> {
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let name = field.name().unwrap_or_default().to_owned();
+                
+                if name == "image" {
+                    match field.bytes().await {
+                        Ok(data) => return Ok(Some(data)),
+                        Err(e) => return Err(format!("Failed to read file bytes: {}", e)),
+                    }
+                }
+            }
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(format!("Multipart parsing failed: {}", e)),
+        }
+    }
 }
 
 #[instrument(level = "info", skip(cache))]
