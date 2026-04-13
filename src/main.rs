@@ -20,6 +20,7 @@ use std::{
     vec,
 };
 use tower_http::add_extension::AddExtensionLayer;
+use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use tokio::{net::TcpListener, sync::Mutex};
@@ -68,6 +69,7 @@ async fn main() {
         .route("/image/{spec}/{url}", get(generate))
         .layer(
             ServiceBuilder::new()
+                .layer(CorsLayer::permissive())
                 .layer(AddExtensionLayer::new(cache))
                 .into_inner(),
     );
