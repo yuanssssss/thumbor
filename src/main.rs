@@ -16,16 +16,21 @@ use std::{
     convert::TryInto,
     hash::{Hash, Hasher},
     num::NonZeroUsize,
+    path::Path as FsPath,
+    path::PathBuf,
     sync::Arc,
     vec,
 };
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
 use uuid::Uuid;
+use tracing_subscriber::filter::EnvFilter;
+use tracing_appender::non_blocking::WorkerGuard;
 
 use tokio::{net::TcpListener, sync::Mutex};
 use tower::ServiceBuilder;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 mod pb;
 use pb::*;
 mod engine;
@@ -45,22 +50,103 @@ struct UploadResponse {
     filename: Option<String>,
 }
 
+struct UploadedImage {
+    data: Bytes,
+    original_filename: Option<String>,
+}
+
 // 10MB limit
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 type Cache = Arc<Mutex<LruCache<u64, Bytes>>>;
+type UploadsPath = Arc<PathBuf>;
+
+/// Get the absolute path for the uploads directory
+fn get_uploads_dir() -> PathBuf {
+    let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    path.push("uploads");
+    path
+}
+
+/// Initialize tracing subscriber with console and file output
+fn init_tracing() -> Option<WorkerGuard> {
+    use tracing_subscriber::{fmt, prelude::*};
+    use std::io;
+
+    // Create logs directory if it doesn't exist
+    let _ = std::fs::create_dir_all("logs");
+
+    // Set default log level to INFO if RUST_LOG is not set
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("thumbor=info,axum=info"));
+
+    // File appender for logs
+    let file_appender = tracing_appender::rolling::daily("logs", "thumbor.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let file_layer = fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(true)
+        .with_level(true)
+        .with_thread_ids(true);
+
+    let console_layer = fmt::layer()
+        .with_writer(io::stdout)
+        .with_ansi(true)
+        .with_target(true)
+        .with_level(true);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
+        .init();
+
+    Some(guard)
+}
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // Initialize logging first
+    let _guard = init_tracing();
+    
+    info!("╔══════════════════════════════════════╗");
+    info!("║   Thumbor Image Server Starting     ║");
+    info!("╚══════════════════════════════════════╝");
+    
+    // Get working directory and uploads path
+    let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    info!("Working directory: {}", work_dir.display());
+    
+    let uploads_dir = get_uploads_dir();
+    info!("Uploads directory: {}", uploads_dir.display());
+    
     let cache: Cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())));
+    let uploads_path: UploadsPath = Arc::new(uploads_dir);
     
     // Create uploads directory if it doesn't exist
-    let uploads_dir = "uploads";
-    tokio::fs::create_dir_all(uploads_dir)
-        .await
-        .expect("Failed to create uploads directory");
-    info!("Uploads directory created/verified at: {}", uploads_dir);
+    match tokio::fs::create_dir_all(uploads_path.as_ref()).await {
+        Ok(_) => info!("✓ Uploads directory ready: {}", uploads_path.display()),
+        Err(e) => {
+            info!("✗ Failed to create uploads directory: {}", e);
+            eprintln!("Failed to create uploads directory: {}", e);
+            return;
+        }
+    }
+    
+    // Check write permissions
+    match tokio::fs::metadata(uploads_path.as_ref()).await {
+        Ok(meta) => {
+            info!("✓ Uploads directory accessible");
+            if meta.permissions().readonly() {
+                info!("⚠ WARNING: Uploads directory is read-only!");
+            }
+        }
+        Err(e) => {
+            info!("✗ Cannot access uploads directory: {}", e);
+        }
+    }
     
     let app = Router::new()
         .route("/", get(index))
@@ -69,41 +155,101 @@ async fn main() {
         .route("/image/{spec}/{url}", get(generate))
         .layer(
             ServiceBuilder::new()
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                        .on_response(DefaultOnResponse::new().level(tracing::Level::INFO))
+                )
                 .layer(CorsLayer::permissive())
                 .layer(AddExtensionLayer::new(cache))
+                .layer(AddExtensionLayer::new(uploads_path))
                 .into_inner(),
     );
     let addr = "0.0.0.0:3000";
-    let listener = TcpListener::bind(addr).await.unwrap();
-    println!("studio: http://{addr}/");
+    
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => {
+            info!("✓ Server binding successful");
+            l
+        }
+        Err(e) => {
+            info!("✗ Failed to bind to {}: {}", addr, e);
+            eprintln!("Failed to bind to {}: {}", addr, e);
+            return;
+        }
+    };
+    
+    println!("╔══════════════════════════════════════╗");
+    println!("║   🚀 Thumbor Server is Running      ║");
+    println!("╠══════════════════════════════════════╣");
+    println!("║  Studio: http://0.0.0.0:3000/       ║");
+    println!("║  Upload: POST /api/upload            ║");
+    println!("║  Process: POST /api/process          ║");
+    println!("║  Image: GET /image/{{spec}}/{{url}}   ║");
+    println!("║  Logs: ./logs/thumbor.log            ║");
+    println!("╚══════════════════════════════════════╝");
+    
     print_test_url("https://images.pexels.com/photos/1562477/pexels-photo-1562477.jpeg?auto=compress&cs=tinysrgb&dpr=3&h=750&w=1260");
-    info!("listening on {}", addr);
-    axum::serve(listener, app).await.unwrap();
+    
+    info!("Server listening on http://{}", addr);
+    info!("Log level: {} (set RUST_LOG to change)", std::env::var("RUST_LOG").unwrap_or_else(|_| "thumbor=info".to_string()));
+    info!("═══════════════════════════════════════");
+    
+    if let Err(e) = axum::serve(listener, app).await {
+        info!("✗ Server error: {}", e);
+        eprintln!("Server error: {}", e);
+    }
 }
 
 async fn index() -> Html<&'static str> {
+    info!("GET / - Serving index page");
     Html(include_str!("../static/index.html"))
 }
 
-async fn generate(Path(Params { spec, url }): Path<Params>,
+#[instrument(level = "info", skip(cache))]
+async fn generate(
+    Path(Params { spec, url }): Path<Params>,
     Extension(cache): Extension<Cache>
 ) -> Result<(HeaderMap, Vec<u8>), StatusCode> {
+    info!("GET /image/{{spec}}/{{url}} - Received image generation request");
+    info!("  Spec (encoded): {}", spec);
+    info!("  URL (encoded): {}", url);
+    
     let url = percent_decode_str(&url).decode_utf8_lossy();
+    info!("  URL (decoded): {}", url);
+    
     let spec: ImageSpec = spec
         .as_str()
         .try_into()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|e| {
+            warn!("Failed to parse image spec: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+    info!("  Spec parsed successfully");
 
     let data = retrieve_image(&url, cache)
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|e| {
+            warn!("Failed to retrieve image: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+    info!("  Image data retrieved ({} bytes)", data.len());
 
-    let mut engine = Photon::try_from(data).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut engine = Photon::try_from(data).map_err(|e| {
+        warn!("Failed to create Photon engine: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    info!("  Photon engine created");
+    
     engine.apply(&spec.specs);
+    info!("  Image specs applied");
+    
     let image = engine.generate(ImageFormat::Jpeg);
+    info!("  Image generation completed ({} bytes)", image.len());
 
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("image/jpeg"));
+    info!("  ✓ Image generation successful");
     Ok((headers, image))
 }
 
@@ -126,20 +272,35 @@ struct ProcessOptions {
     watermark_y: Option<u32>,
 }
 
-async fn process_upload(mut multipart: Multipart) -> Result<(HeaderMap, Vec<u8>), StatusCode> {
+async fn process_upload(
+    Extension(uploads_path): Extension<UploadsPath>,
+    mut multipart: Multipart,
+) -> Result<(HeaderMap, Vec<u8>), StatusCode> {
+    info!("POST /api/process - Image processing request received");
     let mut image = None;
+    let mut original_filename = None;
     let mut options = ProcessOptions::default();
 
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .map_err(|e| {
+            warn!("Failed to read multipart field: {}", e);
+            StatusCode::BAD_REQUEST
+        })?
     {
         let name = field.name().unwrap_or_default().to_owned();
+        info!("  Processing field: {}", name);
+        
         match name.as_str() {
             "image" => {
-                let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+                original_filename = field.file_name().map(str::to_owned);
+                let data = field.bytes().await.map_err(|e| {
+                    warn!("Failed to read image bytes: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
                 if !data.is_empty() {
+                    info!("  Image field received ({} bytes)", data.len());
                     image = Some(data);
                 }
             }
@@ -158,27 +319,90 @@ async fn process_upload(mut multipart: Multipart) -> Result<(HeaderMap, Vec<u8>)
             "watermark" => options.watermark = parse_checkbox(field).await?,
             "watermark_x" => options.watermark_x = parse_optional_u32(field).await?,
             "watermark_y" => options.watermark_y = parse_optional_u32(field).await?,
-            _ => {}
+            _ => {
+                info!("  Unknown field ignored: {}", name);
+            }
         }
     }
 
-    let image = image.ok_or(StatusCode::BAD_REQUEST)?;
-    let mut engine = Photon::try_from(image).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let image = image.ok_or_else(|| {
+        warn!("No image field found in request");
+        StatusCode::BAD_REQUEST
+    })?;
+    info!("Image data prepared for processing");
+
+    let upload_id = Uuid::new_v4();
+    let original_extension = detect_upload_extension(original_filename.as_deref(), &image);
+    let original_filename = format!("{}_original.{}", upload_id, original_extension);
+    let original_filepath = uploads_path.join(&original_filename);
+
+    info!("  Saving original uploaded image:");
+    info!("    Filename: {}", original_filename);
+    info!("    Path: {}", original_filepath.display());
+
+    if let Err(e) = tokio::fs::write(&original_filepath, &image).await {
+        warn!(
+            "⚠ Failed to save original uploaded image to {}: {}",
+            original_filepath.display(),
+            e
+        );
+    } else {
+        info!(
+            "  ✓ Original uploaded image saved successfully to: {}",
+            original_filepath.display()
+        );
+    }
+    
+    let mut engine = Photon::try_from(image).map_err(|e| {
+        warn!("Failed to create Photon engine: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    info!("Photon engine created");
+    
     let specs = build_specs(&options);
+    info!("Processing options applied");
     engine.apply(&specs);
+
+    let result = engine.generate(ImageFormat::Jpeg);
+    info!("✓ Image processing completed ({} bytes)", result.len());
+    
+    // Save the processed image
+    let filename = format!("{}_processed.jpg", upload_id);
+    let filepath = uploads_path.join(&filename);
+    
+    info!("  Saving processed image:");
+    info!("    Filename: {}", filename);
+    info!("    Path: {}", filepath.display());
+    
+    if let Err(e) = tokio::fs::write(&filepath, &result).await {
+        warn!("⚠ Failed to save processed image to {}: {}", filepath.display(), e);
+    } else {
+        info!("  ✓ Processed image saved successfully to: {}", filepath.display());
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("image/jpeg"));
-    Ok((headers, engine.generate(ImageFormat::Jpeg)))
+    Ok((headers, result))
 }
 
 #[instrument(level = "info")]
-async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse>, StatusCode> {
-    let uploads_dir = "uploads";
+async fn upload_and_save(
+    Extension(uploads_path): Extension<UploadsPath>,
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>, StatusCode> {
+    info!("POST /api/upload - Image upload request received");
+    info!("  Uploads directory: {}", uploads_path.display());
     
     // Parse multipart form with better error handling
     match parse_multipart_field(&mut multipart).await {
-        Ok(Some(data)) => {
+        Ok(Some(uploaded)) => {
+            let UploadedImage {
+                data,
+                original_filename,
+            } = uploaded;
+
+            info!("  Received data: {} bytes", data.len());
+            
             // Check file size (10MB limit)
             if data.len() > MAX_FILE_SIZE as usize {
                 let msg = format!(
@@ -186,17 +410,18 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
                     data.len(), 
                     MAX_FILE_SIZE
                 );
-                info!("Upload failed: {}", msg);
+                warn!("✗ {}", msg);
                 return Ok(Json(UploadResponse {
                     success: false,
                     message: msg,
                     filename: None,
                 }));
             }
+            info!("  ✓ File size check passed");
             
             if data.is_empty() {
                 let msg = "Empty file".to_string();
-                info!("Upload failed: {}", msg);
+                warn!("✗ {}", msg);
                 return Ok(Json(UploadResponse {
                     success: false,
                     message: msg,
@@ -205,33 +430,64 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
             }
             
             // Try to determine image format, but don't fail if we can't
-            // Some image formats may not be recognized, but we save anyway
             if let Ok(format) = image::guess_format(&data) {
-                info!("Detected image format: {:?}", format);
+                info!("  Image format detected: {:?}", format);
             } else {
-                info!("Could not detect image format, but proceeding with upload");
+                info!("  Could not detect image format, but proceeding with upload");
             }
             
+            let extension = detect_upload_extension(original_filename.as_deref(), &data);
+
             // Generate unique filename
             let uuid = Uuid::new_v4();
-            let filename = format!("{}.jpg", uuid);
-            let filepath = format!("{}/{}", uploads_dir, filename);
+            let filename = format!("{}.{}", uuid, extension);
+            let filepath = uploads_path.join(&filename);
+            
+            info!("  Filename: {}", filename);
+            info!("  Full path: {}", filepath.display());
+            
+            // Check if uploads directory exists and is writable
+            match tokio::fs::metadata(uploads_path.as_ref()).await {
+                Ok(meta) => {
+                    info!("  Directory check: exists={}, readonly={}", true, meta.permissions().readonly());
+                }
+                Err(e) => {
+                    warn!("  ⚠ Directory check failed: {}", e);
+                }
+            }
             
             // Save the file
             match tokio::fs::write(&filepath, &data).await {
                 Ok(_) => {
-                    info!("Image saved successfully: {} ({} bytes)", filename, data.len());
-                    Ok(Json(UploadResponse {
-                        success: true,
-                        message: "Image uploaded and saved successfully".to_string(),
-                        filename: Some(filename),
-                    }))
+                    info!("  File write completed");
+                    
+                    // Verify file was actually created
+                    match tokio::fs::metadata(&filepath).await {
+                        Ok(meta) => {
+                            info!("  ✓ File verified: size={} bytes", meta.len());
+                            info!("✓ Image saved successfully: {} ({} bytes)", filepath.display(), data.len());
+                            Ok(Json(UploadResponse {
+                                success: true,
+                                message: format!("Image uploaded and saved to: {}", filepath.display()),
+                                filename: Some(filename),
+                            }))
+                        }
+                        Err(e) => {
+                            warn!("  ✗ File verification failed: {} (created but cannot stat)", e);
+                            warn!("✗ Failed to verify saved file: {}", e);
+                            Ok(Json(UploadResponse {
+                                success: false,
+                                message: format!("File created but verification failed: {}", e),
+                                filename: None,
+                            }))
+                        }
+                    }
                 }
                 Err(e) => {
-                    info!("Failed to save file: {}", e);
+                    warn!("✗ Failed to save file to {}: {} (code: {})", filepath.display(), e, e.kind());
                     Ok(Json(UploadResponse {
                         success: false,
-                        message: format!("Failed to save file: {}", e),
+                        message: format!("Failed to save file: {} (kind: {:?})", e, e.kind()),
                         filename: None,
                     }))
                 }
@@ -239,7 +495,7 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
         }
         Ok(None) => {
             let msg = "No image field found in request".to_string();
-            info!("Upload failed: {}", msg);
+            warn!("✗ {}", msg);
             Ok(Json(UploadResponse {
                 success: false,
                 message: msg,
@@ -247,7 +503,7 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
             }))
         }
         Err(e) => {
-            info!("Multipart parsing error: {}", e);
+            warn!("✗ Multipart parsing error: {}", e);
             Ok(Json(UploadResponse {
                 success: false,
                 message: format!("Invalid request format: {}", e),
@@ -257,15 +513,21 @@ async fn upload_and_save(mut multipart: Multipart) -> Result<Json<UploadResponse
     }
 }
 
-async fn parse_multipart_field(multipart: &mut Multipart) -> Result<Option<Bytes>, String> {
+async fn parse_multipart_field(multipart: &mut Multipart) -> Result<Option<UploadedImage>, String> {
     loop {
         match multipart.next_field().await {
             Ok(Some(field)) => {
                 let name = field.name().unwrap_or_default().to_owned();
                 
                 if name == "image" {
+                    let original_filename = field.file_name().map(str::to_owned);
                     match field.bytes().await {
-                        Ok(data) => return Ok(Some(data)),
+                        Ok(data) => {
+                            return Ok(Some(UploadedImage {
+                                data,
+                                original_filename,
+                            }))
+                        }
                         Err(e) => return Err(format!("Failed to read file bytes: {}", e)),
                     }
                 }
@@ -276,21 +538,75 @@ async fn parse_multipart_field(multipart: &mut Multipart) -> Result<Option<Bytes
     }
 }
 
+fn detect_upload_extension(original_filename: Option<&str>, data: &[u8]) -> String {
+    if let Some(filename) = original_filename {
+        if let Some(extension) = extract_extension(filename) {
+            return extension;
+        }
+    }
+
+    image::guess_format(data)
+        .map(image_format_extension)
+        .unwrap_or("bin")
+        .to_string()
+}
+
+fn extract_extension(filename: &str) -> Option<String> {
+    FsPath::new(filename)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| {
+            ext.chars()
+                .all(|ch| ch.is_ascii_alphanumeric())
+        })
+}
+
+fn image_format_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Png => "png",
+        ImageFormat::Gif => "gif",
+        ImageFormat::WebP => "webp",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        ImageFormat::Tga => "tga",
+        ImageFormat::Pnm => "pnm",
+        ImageFormat::Dds => "dds",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Hdr => "hdr",
+        ImageFormat::OpenExr => "exr",
+        ImageFormat::Farbfeld => "ff",
+        ImageFormat::Avif => "avif",
+        ImageFormat::Qoi => "qoi",
+        _ => "bin",
+    }
+}
+
 #[instrument(level = "info", skip(cache))]
 async fn retrieve_image(url: &str, cache: Cache) -> Result<Bytes> {
+    info!("Retrieving image from: {}", url);
     let mut hasher = DefaultHasher::new();
     url.hash(&mut hasher);
     let hash = hasher.finish();
+    info!("Cache hash: {}", hash);
 
     if let Some(image) = cache.lock().await.get(&hash) {
-        info!("cache hit for url: {}", url);
+        info!("✓ Cache hit! ({} bytes)", image.len());
         return Ok(image.clone());
     }
 
-    info!("cache miss for url: {}", url);
+    info!("Cache miss, downloading from remote URL");
     let response = reqwest::get(url).await?;
+    info!("Response status: {}", response.status());
+    
     let bytes = response.bytes().await?;
+    info!("Downloaded: {} bytes", bytes.len());
+    
     cache.lock().await.put(hash, bytes.clone());
+    info!("✓ Image cached successfully");
     Ok(bytes)
 }
 
