@@ -71,7 +71,7 @@ async fn main() {
                 .layer(AddExtensionLayer::new(cache))
                 .into_inner(),
     );
-    let addr = "127.0.0.1:3000";
+    let addr = "0.0.0.0:3000";
     let listener = TcpListener::bind(addr).await.unwrap();
     println!("studio: http://{addr}/");
     print_test_url("https://images.pexels.com/photos/1562477/pexels-photo-1562477.jpeg?auto=compress&cs=tinysrgb&dpr=3&h=750&w=1260");
